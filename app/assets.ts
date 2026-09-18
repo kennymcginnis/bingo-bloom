@@ -7,22 +7,22 @@ const isDevelopment = nodeEnv === 'development'
 const isHmr = Boolean(isDevelopment && process.env.REMIX_NODE_HMR)
 
 export const assets = createAssetServer({
-  basePath: '/assets',
-  rootDir,
+	basePath: '/assets',
+	rootDir,
 
-  allowFiles: ['app/routes.ts', 'app/**/public/**'],
-  allowPackages: ['remix', 'uqr'],
-  denyFiles: ['app/**/*.test.*'],
-  sourceMaps: isDevelopment ? 'external' : undefined,
-  minify: !isDevelopment,
-  watch: isDevelopment,
-  hmr: isHmr
-    ? {
-        channel: async () => (await import('remix/node-hmr/runtime')).createBrowserHmrChannel(),
-        moduleImporter: 'remix/multiple-import-maps-polyfill',
-      }
-    : undefined,
-  scripts: { loaders: isHmr ? [uiHmr()] : undefined },
+	allowFiles: ['app/routes.ts', 'app/**/public/**'],
+	allowPackages: ['remix', 'uqr'],
+	denyFiles: ['app/**/*.test.*'],
+	sourceMaps: isDevelopment ? 'external' : undefined,
+	minify: !isDevelopment,
+	watch: isDevelopment,
+	hmr: isHmr
+		? {
+				channel: async () => (await import('remix/node-hmr/runtime')).createBrowserHmrChannel(),
+				moduleImporter: 'remix/multiple-import-maps-polyfill',
+		  }
+		: undefined,
+	scripts: { loaders: isHmr ? [uiHmr()] : undefined },
 })
 
 const entry = 'app/actions/public/entry.ts'
