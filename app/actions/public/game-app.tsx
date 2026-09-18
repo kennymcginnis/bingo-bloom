@@ -1,11 +1,13 @@
 import { clientEntry, on, ref, type Handle, type SerializableProps } from 'remix/ui'
+import { renderSVG } from 'uqr'
 
 type Word = { id: number; text: string; position?: number; called?: number }
 type Player = { id: number; name: string; joined_at: string; claimed_at: string | null; verified: number | null; best_line_progress?: number }
 type CardCell = { id?: number; text: string; free?: boolean; called?: boolean }
 type GameState = {
   code: string; title: string; size: number; role: 'admin' | 'player'; words: Word[]
-  players?: Player[]; player?: { name: string; claimedAt: string | null; verified: number | null }
+  joiningLocked: boolean; endedAt: string | null
+  players?: Player[]; player?: { name: string; claimedAt: string | null; verified: number | null; rejoinCode: string | null }
   card?: CardCell[]; marks?: number[]
 }
 type PlayerBoardState = { player: Player; card: CardCell[]; marks: number[] }
@@ -25,9 +27,16 @@ export const GameApp = clientEntry(import.meta.url, function GameApp(handle: Han
   let messages: ChatMessage[] = []
   let chatError = ''
   let chatBusy = false
+  let inviteQr = ''
   const tokenKey = () => `bingo:${handle.props.role}:${handle.props.code}`
   const token = () => localStorage.getItem(tokenKey()) ?? ''
   const auth = () => ({ Authorization: `Bearer ${token()}` })
+
+  const mergeMessage = (message: ChatMessage) => {
+    messages = [...messages.filter((existing) => existing.id !== message.id), message]
+      .sort((left, right) => left.id - right.id)
+      .slice(-100)
+  }
 
   const loadPlayerBoard = async (playerId: number, showLoading = true) => {
     if (showLoading) {
@@ -101,7 +110,7 @@ export const GameApp = clientEntry(import.meta.url, function GameApp(handle: Han
       })
       const result = (await response.json()) as { message?: ChatMessage; error?: string }
       if (!response.ok || !result.message) throw new Error(result.error ?? 'Could not send that message.')
-      messages = [...messages, result.message]
+      mergeMessage(result.message)
       chatBusy = false
       handle.update()
       return true
@@ -113,14 +122,60 @@ export const GameApp = clientEntry(import.meta.url, function GameApp(handle: Han
     }
   }
 
-  handle.queueTask(() => {
+  const waitToReconnect = () => new Promise<void>((resolve) => {
+    const timeout = setTimeout(resolve, 1_500)
+    handle.signal.addEventListener('abort', () => { clearTimeout(timeout); resolve() }, { once: true })
+  })
+
+  const connectEvents = async () => {
+    while (!handle.signal.aborted && token()) {
+      try {
+        const response = await fetch(`/api/games/${handle.props.code}/events`, {
+          headers: auth(), cache: 'no-store', signal: handle.signal,
+        })
+        if (!response.ok || !response.body) throw new Error('Live updates disconnected.')
+        const reader = response.body.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+        while (!handle.signal.aborted) {
+          const { value, done } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const chunks = buffer.split('\n\n')
+          buffer = chunks.pop() ?? ''
+          for (const chunk of chunks) {
+            const data = chunk.split('\n').find((line) => line.startsWith('data: '))?.slice(6)
+            if (!data) continue
+            const event = JSON.parse(data) as { type?: string }
+            if (event.type === 'chat') void refreshChat()
+            if (event.type === 'state') void refresh()
+          }
+        }
+      } catch {
+        if (handle.signal.aborted) return
+      }
+      await waitToReconnect()
+    }
+  }
+
+  handle.queueTask(async () => {
+    const fragment = new URLSearchParams(window.location.hash.slice(1))
+    const recoveredToken = fragment.get('access')
+    if (recoveredToken) {
+      localStorage.setItem(tokenKey(), recoveredToken)
+      history.replaceState(null, '', window.location.pathname + window.location.search)
+    }
+    if (handle.props.role === 'admin') {
+      const inviteUrl = new URL(`/join/${encodeURIComponent(handle.props.code)}`, window.location.origin).toString()
+      try {
+        const svg = renderSVG(inviteUrl, { border: 1, pixelSize: 5, blackColor: '#19332f', whiteColor: '#fffaf1' })
+        inviteQr = `data:image/svg+xml,${encodeURIComponent(svg)}`
+      } catch {}
+    }
     void refresh()
     void refreshChat()
-    const interval = setInterval(() => {
-      if (handle.props.role === 'admin') void refresh()
-      void refreshChat()
-    }, 2500)
-    handle.signal.addEventListener('abort', () => clearInterval(interval), { once: true })
+    void connectEvents()
+    handle.update()
   })
 
   const post = async (path: string, body?: unknown) => {
@@ -135,7 +190,7 @@ export const GameApp = clientEntry(import.meta.url, function GameApp(handle: Han
   return () => {
     if (!state) return <LoadingPage role={handle.props.role} code={handle.props.code} error={error} />
     return state.role === 'admin' ? (
-      <HostDashboard state={state} notice={notice} busy={busy} messages={messages} chatError={chatError} chatBusy={chatBusy} onSendMessage={sendChatMessage} selectedPlayerBoard={selectedPlayerBoard} selectedPlayerId={selectedPlayerId} playerBoardError={playerBoardError} loadingPlayerBoard={loadingPlayerBoard} onSelectPlayer={(player) => {
+      <HostDashboard state={state} notice={notice} busy={busy} inviteQr={inviteQr} messages={messages} chatError={chatError} chatBusy={chatBusy} onSendMessage={sendChatMessage} selectedPlayerBoard={selectedPlayerBoard} selectedPlayerId={selectedPlayerId} playerBoardError={playerBoardError} loadingPlayerBoard={loadingPlayerBoard} onSelectPlayer={(player) => {
         selectedPlayerId = player.id
         selectedPlayerBoard = null
         playerBoardError = ''
@@ -156,9 +211,40 @@ export const GameApp = clientEntry(import.meta.url, function GameApp(handle: Han
         await navigator.clipboard.writeText(inviteUrl)
         notice = 'Invite link copied!'
         handle.update()
+      }} onCopyRecovery={async () => {
+        const recoveryUrl = new URL(`/host/${encodeURIComponent(handle.props.code)}`, window.location.origin)
+        recoveryUrl.hash = new URLSearchParams({ access: token() }).toString()
+        await navigator.clipboard.writeText(recoveryUrl.toString())
+        notice = 'Private host recovery link copied. Keep it secret.'
+        handle.update()
+      }} onToggleLock={async () => {
+        busy = true; handle.update()
+        try { await post('lock', { locked: !state?.joiningLocked }); notice = state?.joiningLocked ? 'Players can join again.' : 'New players are now blocked.'; await refresh() }
+        catch (caught) { notice = caught instanceof Error ? caught.message : 'Could not update joining.' }
+        busy = false; handle.update()
+      }} onEnd={async () => {
+        if (!window.confirm('End this game? Players will no longer be able to mark, chat, or claim Bingo.')) return
+        busy = true; handle.update()
+        try { await post('end'); notice = 'Game ended. Results remain available.'; await refresh() }
+        catch (caught) { notice = caught instanceof Error ? caught.message : 'Could not end the game.' }
+        busy = false; handle.update()
+      }} onClone={async () => {
+        busy = true; handle.update()
+        try {
+          const result = await post('clone') as { code?: string; adminToken?: string }
+          if (!result.code || !result.adminToken) throw new Error('The new game could not be opened.')
+          localStorage.setItem(`bingo:admin:${result.code}`, result.adminToken)
+          window.location.assign(`/host/${result.code}`)
+        } catch (caught) { notice = caught instanceof Error ? caught.message : 'Could not create the new game.'; busy = false; handle.update() }
       }} />
     ) : (
-      <PlayerBoard state={state} notice={notice} busy={busy} messages={messages} chatError={chatError} chatBusy={chatBusy} onSendMessage={sendChatMessage} onMark={async (position) => {
+      <PlayerBoard state={state} notice={notice} busy={busy} messages={messages} chatError={chatError} chatBusy={chatBusy} onSendMessage={sendChatMessage} onCopyRejoin={async () => {
+        const code = state?.player?.rejoinCode
+        if (!code) return
+        await navigator.clipboard.writeText(code)
+        notice = 'Rejoin code copied! Store it somewhere private.'
+        handle.update()
+      }} onMark={async (position) => {
         if (!state) return
         const marks = new Set(state.marks ?? []); const marked = !marks.has(position)
         marked ? marks.add(position) : marks.delete(position)
@@ -182,6 +268,7 @@ function HostDashboard(handle: Handle<{
   state: GameState
   notice: string
   busy: boolean
+  inviteQr: string
   messages: ChatMessage[]
   chatError: string
   chatBusy: boolean
@@ -194,22 +281,27 @@ function HostDashboard(handle: Handle<{
   onClosePlayer: () => void
   onCall: (word: Word) => void
   onCopy: () => void
+  onCopyRecovery: () => void
+  onToggleLock: () => void
+  onEnd: () => void
+  onClone: () => void
 }>) {
   return () => {
-    const { state, notice, busy, messages, chatError, chatBusy, onSendMessage, selectedPlayerBoard, selectedPlayerId, playerBoardError, loadingPlayerBoard, onSelectPlayer, onClosePlayer, onCall, onCopy } = handle.props
+    const { state, notice, busy, inviteQr, messages, chatError, chatBusy, onSendMessage, selectedPlayerBoard, selectedPlayerId, playerBoardError, loadingPlayerBoard, onSelectPlayer, onClosePlayer, onCall, onCopy, onCopyRecovery, onToggleLock, onEnd, onClone } = handle.props
     const called = state.words.filter((word) => word.called).length
     const winners = (state.players ?? []).filter((player) => player.verified === 1)
     return <main className="game-shell host-shell">
       <header className="game-header"><a className="brand" href="/"><span className="brand-mark">B</span><span>Bingo Bloom</span></a><div className="header-actions"><span className="live-pill"><i /> LIVE</span><button className="outline-button" type="button" mix={on('click', () => void onCopy())}>Copy invite</button></div></header>
-      <section className="host-hero"><div><p className="eyebrow"><span /> Organizer desk</p><h1>{state.title}</h1><p>Tap a phrase when it officially happens. Players listen and mark their own cards.</p></div><div className="game-code"><span>GAME CODE</span><strong>{state.code}</strong><small>Share this with your team</small></div></section>
+      <section className="host-hero"><div><p className="eyebrow"><span /> Organizer desk</p><h1>{state.title}</h1><p>Tap a phrase when it officially happens. Players listen and mark their own cards.</p></div><div className="invite-card"><div className="game-code"><span>GAME CODE</span><strong>{state.code}</strong><small>{state.joiningLocked ? 'Joining is locked' : 'Share this with your team'}</small></div>{inviteQr && <img src={inviteQr} alt={`QR code to join game ${state.code}`} />}</div></section>
       {notice && <p className="notice">{notice}</p>}
+      {state.endedAt && <div className="ended-banner"><strong>Game ended</strong><span>Results and boards remain available. Start another game to play again.</span></div>}
       {winners.length > 0 && <div className="winner-banner"><span>★</span><div><b>Verified bingo!</b><p>{winners.map((winner) => winner.name).join(', ')}</p></div></div>}
       <div className="host-grid">
-        <section className="panel call-panel"><div className="panel-heading"><div><p className="step-label">Caller board</p><h2>What’s been said?</h2></div><span>{called} / {state.words.length} called</span></div><div className="word-list">{state.words.map((word) => <button key={word.id} className={word.called ? 'called' : ''} disabled={busy} mix={on('click', () => onCall(word))}><span>{word.called ? '✓' : String((word.position ?? 0) + 1).padStart(2, '0')}</span>{word.text}</button>)}</div></section>
-        <div className="host-sidebar"><aside className="panel players-panel"><div className="panel-heading"><div><p className="step-label">Room</p><h2>{state.players?.length ?? 0} players</h2></div></div>{!state.players?.length ? <div className="empty-state"><span>⌁</span><p>Waiting for teammates to join…</p></div> : <ul className="player-list">{state.players.map((player) => {
+        <section className="panel call-panel"><div className="panel-heading"><div><p className="step-label">Caller board</p><h2>What’s been said?</h2></div><span>{called} / {state.words.length} called</span></div><div className="word-list">{state.words.map((word) => <button key={word.id} className={word.called ? 'called' : ''} disabled={busy || Boolean(state.endedAt)} mix={on('click', () => onCall(word))}><span>{word.called ? '✓' : String((word.position ?? 0) + 1).padStart(2, '0')}</span>{word.text}</button>)}</div></section>
+        <div className="host-sidebar"><section className="panel game-controls"><div className="panel-heading"><div><p className="step-label">Game controls</p><h2>{state.endedAt ? 'Finished' : state.joiningLocked ? 'Room locked' : 'Room open'}</h2></div></div><div><button type="button" disabled={busy || Boolean(state.endedAt)} mix={on('click', onToggleLock)}>{state.joiningLocked ? 'Unlock joining' : 'Lock joining'}</button><button type="button" mix={on('click', onCopyRecovery)}>Copy host recovery link</button><button type="button" disabled={busy} mix={on('click', onClone)}>New game, same phrases</button>{!state.endedAt && <button className="danger-control" type="button" disabled={busy} mix={on('click', onEnd)}>End game</button>}</div></section><aside className="panel players-panel"><div className="panel-heading"><div><p className="step-label">Room</p><h2>{state.players?.length ?? 0} players</h2></div></div>{!state.players?.length ? <div className="empty-state"><span>⌁</span><p>Waiting for teammates to join…</p></div> : <ul className="player-list">{state.players.map((player) => {
           const bestLineProgress = player.best_line_progress ?? 0
           return <li key={player.id}><button type="button" mix={on('click', () => onSelectPlayer(player))}><span className="avatar">{player.name.slice(0, 1).toUpperCase()}</span><span className="player-progress"><span className="player-progress-label"><strong>{player.name}</strong><small>{bestLineProgress} / {state.size}</small></span><span className="player-progress-track" role="progressbar" aria-label={`${player.name}'s best line progress`} aria-valuemin={0} aria-valuemax={state.size} aria-valuenow={bestLineProgress}><span style={{ width: `${(bestLineProgress / state.size) * 100}%` }} /></span></span>{player.verified === 1 ? <b className="verified">WIN ✓</b> : player.verified === 0 ? <b className="rejected">CHECKED</b> : <i aria-hidden="true">view →</i>}</button></li>
-        })}</ul>}</aside><ChatBox messages={messages} error={chatError} busy={chatBusy} onSend={onSendMessage} /></div>
+        })}</ul>}</aside><ChatBox messages={messages} error={chatError} busy={chatBusy} closed={Boolean(state.endedAt)} onSend={onSendMessage} /></div>
       </div>
       {selectedPlayerId !== null && <HostPlayerBoard board={selectedPlayerBoard} size={state.size} error={playerBoardError} loading={loadingPlayerBoard} onClose={onClosePlayer} />}
     </main>
@@ -240,24 +332,25 @@ function HostPlayerBoard(handle: Handle<{ board: PlayerBoardState | null; size: 
   }
 }
 
-function PlayerBoard(handle: Handle<{ state: GameState; notice: string; busy: boolean; messages: ChatMessage[]; chatError: string; chatBusy: boolean; onSendMessage: (text: string) => Promise<boolean>; onMark: (position: number) => void; onClaim: () => void }>) {
+function PlayerBoard(handle: Handle<{ state: GameState; notice: string; busy: boolean; messages: ChatMessage[]; chatError: string; chatBusy: boolean; onSendMessage: (text: string) => Promise<boolean>; onCopyRejoin: () => void; onMark: (position: number) => void; onClaim: () => void }>) {
   return () => {
-    const { state, notice, busy, messages, chatError, chatBusy, onSendMessage, onMark, onClaim } = handle.props
+    const { state, notice, busy, messages, chatError, chatBusy, onSendMessage, onCopyRejoin, onMark, onClaim } = handle.props
     const marks = new Set(state.marks ?? [])
     return <main className="game-shell player-shell">
       <header className="game-header"><a className="brand" href="/"><span className="brand-mark">B</span><span>Bingo Bloom</span></a><span className="code-pill">Game {state.code}</span></header>
       <section className="player-intro"><div><p className="eyebrow"><span /> {state.player?.name}'s card</p><h1>{state.title}</h1></div></section>
+      {state.endedAt && <div className="ended-banner player-ended"><strong>Game ended</strong><span>Your card and the final chat are still available.</span></div>}
       <section className={`card-wrap size-${state.size}`}><div className="bingo-letters" style={{ gridTemplateColumns: `repeat(${state.size}, 1fr)` }}>{'BINGO!'.slice(0, state.size).split('').map((letter, index) => <span key={index}>{letter}</span>)}</div><div className="bingo-card" style={{ gridTemplateColumns: `repeat(${state.size}, 1fr)` }}>{state.card?.map((cell, position) => {
         const isMarked = cell.free || marks.has(position)
-        return <button key={position} className={`${isMarked ? 'marked' : ''} ${cell.free ? 'free' : ''}`} disabled={cell.free} aria-pressed={isMarked} mix={cell.free ? undefined : on('click', () => onMark(position))}><span>{cell.text}</span>{isMarked && <b>✓</b>}</button>
+        return <button key={position} className={`${isMarked ? 'marked' : ''} ${cell.free ? 'free' : ''}`} disabled={cell.free || Boolean(state.endedAt)} aria-pressed={isMarked} mix={cell.free || state.endedAt ? undefined : on('click', () => onMark(position))}><span>{cell.text}</span>{isMarked && <b>✓</b>}</button>
       })}</div></section>
-      <div className="player-footer"><p className="listen-note">Listen closely and tap each phrase when you hear it.</p>{notice && <p className={notice.startsWith('BINGO') ? 'success-notice' : 'notice'} role="status">{notice}</p>}<button className="bingo-button" type="button" disabled={busy} mix={on('click', () => void onClaim())}>{busy ? 'Checking your card…' : 'BINGO!'}</button><p>We’ll verify every marked square before calling the win.</p></div>
-      <ChatBox messages={messages} error={chatError} busy={chatBusy} onSend={onSendMessage} />
+      <div className="player-footer"><p className="listen-note">{state.endedAt ? 'This is your final board.' : 'Listen closely and tap each phrase when you hear it.'}</p>{notice && <p className={notice.startsWith('BINGO') ? 'success-notice' : 'notice'} role="status">{notice}</p>}{!state.endedAt && <><button className="bingo-button" type="button" disabled={busy} mix={on('click', () => void onClaim())}>{busy ? 'Checking your card…' : 'BINGO!'}</button><p>We’ll verify every marked square before calling the win.</p></>} {state.player?.rejoinCode && <div className="rejoin-card"><span>Keep your card safe</span><strong>{state.player.rejoinCode}</strong><button type="button" mix={on('click', onCopyRejoin)}>Copy rejoin code</button></div>}</div>
+      <ChatBox messages={messages} error={chatError} busy={chatBusy} closed={Boolean(state.endedAt)} onSend={onSendMessage} />
     </main>
   }
 }
 
-function ChatBox(handle: Handle<{ messages: ChatMessage[]; error: string; busy: boolean; onSend: (text: string) => Promise<boolean> }>) {
+function ChatBox(handle: Handle<{ messages: ChatMessage[]; error: string; busy: boolean; closed: boolean; onSend: (text: string) => Promise<boolean> }>) {
   let messageList: HTMLDivElement | null = null
   let latestMessageId = 0
 
@@ -276,7 +369,7 @@ function ChatBox(handle: Handle<{ messages: ChatMessage[]; error: string; busy: 
         {handle.props.messages.length === 0 ? <div className="chat-empty"><span>✦</span><p>No messages yet. Break the ice!</p></div> : handle.props.messages.map((message) => <article key={message.id} className={`${message.own ? 'own' : ''} ${message.role === 'host' ? 'host-message' : ''}`}><div><strong>{message.own ? 'You' : message.name}</strong><time dateTime={message.created_at}>{formatChatTime(message.created_at)}</time></div><p>{message.text}</p></article>)}
       </div>
       {handle.props.error && <p className="chat-error" role="alert">{handle.props.error}</p>}
-      <form className="chat-compose" mix={on('submit', async (event) => {
+      {handle.props.closed ? <p className="chat-closed">Chat closed when the game ended.</p> : <form className="chat-compose" mix={on('submit', async (event) => {
         event.preventDefault()
         const form = event.currentTarget
         const text = String(new FormData(form).get('message') ?? '').trim()
@@ -286,7 +379,7 @@ function ChatBox(handle: Handle<{ messages: ChatMessage[]; error: string; busy: 
         <label className="sr-only" htmlFor="chat-message">Message</label>
         <input id="chat-message" name="message" maxLength={280} placeholder="Say something…" autoComplete="off" required />
         <button type="submit" disabled={handle.props.busy} aria-label="Send message">{handle.props.busy ? '…' : '↑'}</button>
-      </form>
+      </form>}
     </section>
   }
 }

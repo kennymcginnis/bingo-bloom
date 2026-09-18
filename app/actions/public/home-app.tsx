@@ -1,6 +1,7 @@
 import { clientEntry, on, ref, type Handle, type SerializableProps } from 'remix/ui'
 
 type Panel = 'create' | 'join'
+type JoinMode = 'new' | 'rejoin'
 type PlayerRange = 'small' | 'medium' | 'large'
 type UiState = {
   panel: Panel
@@ -10,6 +11,8 @@ type UiState = {
   words: string
   joinCode: string
   joinName: string
+  joinMode: JoinMode
+  rejoinCode: string
 }
 
 interface HomeAppProps extends SerializableProps {
@@ -44,6 +47,8 @@ export const HomeApp = clientEntry(import.meta.url, function HomeApp(handle: Han
   let draftWords = examples
   let joinCode = initialCode
   let joinName = ''
+  let joinMode: JoinMode = 'new'
+  let rejoinCode = ''
 
   const saveUiState = () => {
     const value: UiState = {
@@ -54,6 +59,8 @@ export const HomeApp = clientEntry(import.meta.url, function HomeApp(handle: Han
       words: draftWords,
       joinCode,
       joinName,
+      joinMode,
+      rejoinCode,
     }
     localStorage.setItem(UI_STATE_KEY, JSON.stringify(value))
   }
@@ -74,6 +81,8 @@ export const HomeApp = clientEntry(import.meta.url, function HomeApp(handle: Han
       if (saved.playerRange === 'small' || saved.playerRange === 'medium' || saved.playerRange === 'large') playerRange = saved.playerRange
       if (!initialCode && typeof saved.joinCode === 'string') joinCode = saved.joinCode
       if (typeof saved.joinName === 'string') joinName = saved.joinName
+      if (!isDirectJoin && (saved.joinMode === 'new' || saved.joinMode === 'rejoin')) joinMode = saved.joinMode
+      if (typeof saved.rejoinCode === 'string') rejoinCode = saved.rejoinCode
       if (typeof saved.title === 'string') {
         draftTitle = saved.title
         if (titleElement) titleElement.value = saved.title
@@ -122,11 +131,14 @@ export const HomeApp = clientEntry(import.meta.url, function HomeApp(handle: Han
     handle.update()
     const formData = new FormData(form)
     const code = String(formData.get('code') ?? '').trim().toUpperCase()
-    const response = await fetch(`/api/games/${encodeURIComponent(code)}/join`, {
+    const endpoint = joinMode === 'rejoin' ? 'rejoin' : 'join'
+    const response = await fetch(`/api/games/${encodeURIComponent(code)}/${endpoint}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: formData.get('name') }), signal,
+      body: JSON.stringify(joinMode === 'rejoin'
+        ? { rejoinCode: formData.get('rejoinCode') }
+        : { name: formData.get('name') }), signal,
     })
-    const result = (await response.json()) as { playerToken?: string; error?: string }
+    const result = (await response.json()) as { playerToken?: string; rejoinCode?: string; error?: string }
     if (signal.aborted) return
     if (!response.ok || !result.playerToken) {
       busy = false; error = result.error ?? 'Could not join that game.'; handle.update(); return
@@ -134,6 +146,7 @@ export const HomeApp = clientEntry(import.meta.url, function HomeApp(handle: Han
     joinCode = ''
     saveUiState()
     localStorage.setItem(`bingo:player:${code}`, result.playerToken)
+    if (result.rejoinCode) localStorage.setItem(`bingo:rejoin:${code}`, result.rejoinCode)
     window.location.assign(`/game/${code}`)
   }
 
@@ -173,10 +186,11 @@ export const HomeApp = clientEntry(import.meta.url, function HomeApp(handle: Han
           ) : (
             <form className="form-stack join-form" mix={on('submit', (event, signal) => { event.preventDefault(); void submitJoin(event.currentTarget, signal) })}>
               <div className="join-intro"><span className="big-dot">●</span><h2>Ready to play?</h2><p>Grab the six-character code from your host. Your card will be all yours.</p></div>
+              <div className="join-mode-tabs" role="group" aria-label="Join options"><button type="button" className={joinMode === 'new' ? 'active' : ''} aria-pressed={joinMode === 'new'} mix={on('click', () => { joinMode = 'new'; error = ''; saveUiState(); handle.update() })}>New player</button><button type="button" className={joinMode === 'rejoin' ? 'active' : ''} aria-pressed={joinMode === 'rejoin'} mix={on('click', () => { joinMode = 'rejoin'; error = ''; saveUiState(); handle.update() })}>Rejoin my card</button></div>
               <div><label htmlFor="code">Game code</label><input className="code-input" id="code" name="code" placeholder="ABC123" maxLength={6} autoCapitalize="characters" value={joinCode} required mix={on('input', (event) => { joinCode = event.currentTarget.value.toUpperCase(); saveUiState(); handle.update() })} /></div>
-              <div><label htmlFor="name">Your name</label><input id="name" name="name" placeholder="Jamie" maxLength={40} autoComplete="name" value={joinName} required mix={on('input', (event) => { joinName = event.currentTarget.value; saveUiState(); handle.update() })} /></div>
+              {joinMode === 'new' ? <div><label htmlFor="name">Your name</label><input id="name" name="name" placeholder="Jamie" maxLength={40} autoComplete="name" value={joinName} required mix={on('input', (event) => { joinName = event.currentTarget.value; saveUiState(); handle.update() })} /></div> : <div><label htmlFor="rejoinCode">Your rejoin code</label><input className="code-input" id="rejoinCode" name="rejoinCode" placeholder="R7K9QP" maxLength={6} autoCapitalize="characters" value={rejoinCode} required mix={on('input', (event) => { rejoinCode = event.currentTarget.value.toUpperCase(); saveUiState(); handle.update() })} /><small className="field-help">This restores your original card and marks.</small></div>}
               {error && <p className="form-error" role="alert">{error}</p>}
-              <button className="primary-button" type="submit" disabled={busy}>{busy ? 'Shuffling your card…' : 'Join the game'} <span aria-hidden="true">→</span></button>
+              <button className="primary-button" type="submit" disabled={busy}>{busy ? 'Finding your card…' : joinMode === 'rejoin' ? 'Restore my card' : 'Join the game'} <span aria-hidden="true">→</span></button>
             </form>
           )}
         </div>

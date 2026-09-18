@@ -10,7 +10,10 @@ A multiplayer, phone-friendly bingo app built as a Remix 3 proof of concept. Org
 - Restores unfinished game setup and join details from local browser storage
 - Generates and persists a different shuffled card for every player
 - Keeps organizer and player access private with device-local capability tokens
-- Syncs called phrases and player status automatically
+- Gives players a private rejoin code and organizers a private recovery link
+- Shows a scannable QR invite on the organizer dashboard
+- Streams chat and room changes live without exposing called phrases to players
+- Lets organizers lock joining, end a game, or start again with the same phrase list
 - Rejects a claim if any marked square was not officially called
 - Confirms complete rows, columns, and diagonals
 - Works as one deployable Node service with SQLite persistence
@@ -43,8 +46,19 @@ For Render, Railway, Fly.io, or another container host:
 1. Deploy this repository using the Dockerfile.
 2. Attach a persistent volume mounted at `/data`.
 3. Expose container port `3000` over HTTPS.
+4. Configure the platform health check to request `/health`.
 
 SQLite is a good fit for a small team and a single application instance. If the app grows to multiple instances, move the persistence functions in `app/data/database.ts` to shared Postgres storage.
+
+Keep the service at one replica while it uses SQLite and the in-process live-event stream. The included `.dockerignore` prevents local databases and host `node_modules` from being copied into the production image.
+
+## Recovery and game controls
+
+- A player's six-character rejoin code restores the same card and marks in another browser.
+- **Copy host recovery link** creates a private URL fragment containing organizer access. URL fragments are not sent in HTTP requests, but anyone holding the link can control the game.
+- Locking a room blocks new players while still allowing existing players to rejoin.
+- Ending a game makes calling, marking, claiming, and chatting read-only. Results remain visible.
+- **New game, same phrases** creates a fresh room with clean cards and chat.
 
 ## Phrase-pool recommendations
 

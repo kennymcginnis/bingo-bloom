@@ -1,0 +1,9 @@
+node_modules
+db/*.sqlite*
+data/*.sqlite*
+tmp
+.git
+.codex
+.agents
+.DS_Store
+*.log

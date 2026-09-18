@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
+import { publishGameEvent } from './game-events.ts'
 import { bestLineProgress, cardSignature, makeCard, makeCode, makeToken, validateClaim } from './game-rules.ts'
 
 mkdirSync(process.env.DATA_DIR ?? './db', { recursive: true })
@@ -17,6 +18,8 @@ sqlite.exec(`
 		title       TEXT NOT NULL,
 		size        INTEGER NOT NULL, 
 		admin_token TEXT UNIQUE NOT NULL,
+		joining_locked INTEGER NOT NULL DEFAULT 0,
+		ended_at    TEXT,
 		created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
   CREATE TABLE IF NOT EXISTS words (
@@ -34,6 +37,7 @@ sqlite.exec(`
 		token          TEXT UNIQUE NOT NULL, 
 		card_json      TEXT NOT NULL,
 		card_signature TEXT NOT NULL, 
+		rejoin_code    TEXT,
 		claimed_at     TEXT, 
 		verified       INTEGER,
 		joined_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -55,44 +59,54 @@ sqlite.exec(`
   CREATE INDEX IF NOT EXISTS chat_messages_game_id_id ON chat_messages(game_id, id);
 `)
 
-const chatColumns = sqlite.prepare('PRAGMA table_info(chat_messages)').all() as Array<{ name: string }>
-if (!chatColumns.some((column) => column.name === 'sender_role')) {
-  sqlite.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;')
-  try {
-    sqlite.exec(`
-      ALTER TABLE chat_messages RENAME TO chat_messages_legacy;
-      CREATE TABLE chat_messages (
-        id          INTEGER PRIMARY KEY, game_id INTEGER NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-        player_id   INTEGER REFERENCES players(id) ON DELETE CASCADE,
-        sender_role TEXT NOT NULL DEFAULT 'player' CHECK(sender_role IN ('player', 'host')),
-        text        TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-      );
-      INSERT INTO chat_messages (id, game_id, player_id, sender_role, text, created_at)
-      SELECT id, game_id, player_id, 'player', text, created_at 
-			FROM chat_messages_legacy;
-      DROP TABLE chat_messages_legacy;
-      CREATE INDEX chat_messages_game_id_id ON chat_messages(game_id, id);
-      COMMIT;
-    `)
-  } catch (error) {
-    sqlite.exec('ROLLBACK;')
-    throw error
-  } finally {
-    sqlite.exec('PRAGMA foreign_keys = ON;')
-  }
+const gameColumns = sqlite.prepare('PRAGMA table_info(games)').all() as Array<{ name: string }>
+if (!gameColumns.some((column) => column.name === 'joining_locked')) {
+  sqlite.exec('ALTER TABLE games ADD COLUMN joining_locked INTEGER NOT NULL DEFAULT 0')
+}
+if (!gameColumns.some((column) => column.name === 'ended_at')) {
+  sqlite.exec('ALTER TABLE games ADD COLUMN ended_at TEXT')
 }
 
-type GameRow = { id: number; code: string; title: string; size: number; admin_token: string }
-type PlayerRow = {
+const playerColumns = sqlite.prepare('PRAGMA table_info(players)').all() as Array<{ name: string }>
+if (!playerColumns.some((column) => column.name === 'rejoin_code')) {
+  sqlite.exec('ALTER TABLE players ADD COLUMN rejoin_code TEXT')
+}
+sqlite.exec('CREATE UNIQUE INDEX IF NOT EXISTS players_game_rejoin_code ON players(game_id, rejoin_code)')
+
+export type GameRow = {
+  id: number
+  code: string
+  title: string
+  size: number
+  admin_token: string
+  joining_locked: number
+  ended_at: string | null
+}
+export type PlayerRow = {
   id: number
   game_id: number
   name: string
   token: string
   card_json: string
+  rejoin_code: string | null
   claimed_at: string | null
   verified: number | null
   joined_at: string
 }
+
+function makeRejoinCode(gameId: number): string {
+  let code = makeCode()
+  while (sqlite.prepare('SELECT 1 FROM players WHERE game_id = ? AND rejoin_code = ?').get(gameId, code)) {
+    code = makeCode()
+  }
+  return code
+}
+
+const playersMissingRejoinCodes = sqlite
+  .prepare('SELECT id, game_id FROM players WHERE rejoin_code IS NULL')
+  .all() as Array<{ id: number; game_id: number }>
+const updateRejoinCode = sqlite.prepare('UPDATE players SET rejoin_code = ? WHERE id = ?')
+for (const player of playersMissingRejoinCodes) updateRejoinCode.run(makeRejoinCode(player.game_id), player.id)
 
 export function findGame(code: string): GameRow | undefined {
   return sqlite.prepare('SELECT * FROM games WHERE code = ?').get(code.toUpperCase()) as GameRow | undefined
@@ -131,10 +145,19 @@ export function joinGame(game: GameRow, name: string) {
     if (!exists) break
   }
   const token = makeToken()
+  const rejoinCode = makeRejoinCode(game.id)
   sqlite
-    .prepare('INSERT INTO players (game_id, name, token, card_json, card_signature) VALUES (?, ?, ?, ?, ?)')
-    .run(game.id, name, token, JSON.stringify(card), cardSignature(card))
-  return { playerToken: token }
+    .prepare('INSERT INTO players (game_id, name, token, card_json, card_signature, rejoin_code) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(game.id, name, token, JSON.stringify(card), cardSignature(card), rejoinCode)
+  publishGameEvent(game.id, { type: 'state' })
+  return { playerToken: token, rejoinCode }
+}
+
+export function rejoinGame(game: GameRow, rejoinCode: string) {
+  const player = sqlite
+    .prepare('SELECT token, name FROM players WHERE game_id = ? AND rejoin_code = ?')
+    .get(game.id, rejoinCode.toUpperCase()) as Pick<PlayerRow, 'token' | 'name'> | undefined
+  return player ? { playerToken: player.token, name: player.name } : null
 }
 
 export function gameState(game: GameRow, token: string) {
@@ -152,6 +175,8 @@ export function gameState(game: GameRow, token: string) {
     code: game.code,
     title: game.title,
     size: game.size,
+    joiningLocked: Boolean(game.joining_locked),
+    endedAt: game.ended_at,
     role: isAdmin ? 'admin' : 'player',
     words: isAdmin ? words : [],
   }
@@ -179,7 +204,12 @@ export function gameState(game: GameRow, token: string) {
   } else if (player) {
     const cardIds = JSON.parse(player.card_json) as Array<number | null>
     const lookup = new Map(words.map((word) => [word.id, word.text]))
-    state.player = { name: player.name, claimedAt: player.claimed_at, verified: player.verified }
+    state.player = {
+      name: player.name,
+      claimedAt: player.claimed_at,
+      verified: player.verified,
+      rejoinCode: player.rejoin_code,
+    }
     state.card = cardIds.map((id) => (id === null ? { free: true, text: 'FREE' } : { id, text: lookup.get(id) }))
     state.marks = (
       sqlite.prepare('SELECT cell_position FROM marks WHERE player_id = ?').all(player.id) as Array<{
@@ -224,7 +254,7 @@ export function playerBoardState(game: GameRow, playerId: number) {
   }
 }
 
-function authorizedPlayer(game: GameRow, token: string): PlayerRow | undefined {
+export function authorizedPlayer(game: GameRow, token: string): PlayerRow | undefined {
   return sqlite.prepare('SELECT * FROM players WHERE game_id = ? AND token = ?').get(game.id, token) as
     | PlayerRow
     | undefined
@@ -258,13 +288,16 @@ export function addChatMessage(game: GameRow, token: string, text: string) {
   const result = sqlite
     .prepare('INSERT INTO chat_messages (game_id, player_id, sender_role, text) VALUES (?, ?, ?, ?) RETURNING id, created_at')
     .get(game.id, player?.id ?? null, role, text) as { id: number; created_at: string }
-  return { ...result, name: isHost ? 'Host' : player?.name ?? 'Player', role, text, own: true }
+  const message = { ...result, playerId: player?.id ?? null, name: isHost ? 'Host' : player?.name ?? 'Player', role, text }
+  publishGameEvent(game.id, { type: 'chat', message })
+  return { ...message, own: true }
 }
 
 export function setCalled(game: GameRow, wordId: number, called: boolean) {
   const word = sqlite.prepare('SELECT id FROM words WHERE id = ? AND game_id = ?').get(wordId, game.id)
   if (!word) return false
   sqlite.prepare('UPDATE words SET called = ? WHERE id = ?').run(called ? 1 : 0, wordId)
+  publishGameEvent(game.id, { type: 'state' })
   return true
 }
 
@@ -278,6 +311,7 @@ export function setMark(game: GameRow, token: string, position: number, marked: 
   if (marked) sqlite.prepare('INSERT OR IGNORE INTO marks (player_id, cell_position) VALUES (?, ?)').run(player.id, position)
   else sqlite.prepare('DELETE FROM marks WHERE player_id = ? AND cell_position = ?').run(player.id, position)
   sqlite.prepare('UPDATE players SET claimed_at = NULL, verified = NULL WHERE id = ?').run(player.id)
+  publishGameEvent(game.id, { type: 'state' })
   return { ok: true }
 }
 
@@ -297,6 +331,7 @@ export function claim(game: GameRow, token: string) {
   sqlite
     .prepare('UPDATE players SET claimed_at = CURRENT_TIMESTAMP, verified = ? WHERE id = ?')
     .run(result.valid ? 1 : 0, player.id)
+  publishGameEvent(game.id, { type: 'state' })
   return result.valid
     ? { valid: true }
     : {
@@ -306,4 +341,37 @@ export function claim(game: GameRow, token: string) {
           ? `${result.wrong.length} marked square${result.wrong.length === 1 ? ' is' : 's are'} not on the called list.`
           : "You don't have a complete row, column, or diagonal yet.",
       }
+}
+
+export function hasGameAccess(game: GameRow, token: string) {
+  return token === game.admin_token || Boolean(authorizedPlayer(game, token))
+}
+
+export function setJoiningLocked(game: GameRow, locked: boolean) {
+  if (game.ended_at) return false
+  sqlite.prepare('UPDATE games SET joining_locked = ? WHERE id = ?').run(locked ? 1 : 0, game.id)
+  publishGameEvent(game.id, { type: 'state' })
+  return true
+}
+
+export function endGame(game: GameRow) {
+  sqlite.prepare('UPDATE games SET ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP), joining_locked = 1 WHERE id = ?').run(game.id)
+  publishGameEvent(game.id, { type: 'state' })
+}
+
+export function cloneGame(game: GameRow) {
+  const words = sqlite
+    .prepare('SELECT text FROM words WHERE game_id = ? ORDER BY position')
+    .all(game.id) as Array<{ text: string }>
+  return createGame(game.title, game.size, words.map((word) => word.text))
+}
+
+export function databaseHealth() {
+  const result = sqlite.prepare('SELECT 1 AS ok').get() as { ok: number }
+  return result.ok === 1
+}
+
+export function closeDatabase() {
+  sqlite.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+  sqlite.close()
 }
