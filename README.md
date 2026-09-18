@@ -39,7 +39,7 @@ npm test
 
 ## Deploy
 
-The included `Dockerfile` runs the app on port `3000`. Mount a persistent disk at `/data`; the container sets `DATA_DIR=/data` so games survive restarts.
+The included `Dockerfile` runs the app on port `3000`. Mount a platform-managed persistent disk at `/data`; the container sets `DATA_DIR=/data` so games survive restarts. The Dockerfile intentionally does not declare `VOLUME`, because Railway requires volumes to be configured through its service settings.
 
 For Render, Railway, Fly.io, or another container host:
 
